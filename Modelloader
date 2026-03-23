@@ -1,0 +1,169 @@
+import torch
+import torch.nn as nn
+import numpy as np
+from pathlib import Path
+from PIL import Image
+import torchvision.models as models
+import torch.nn.functional as F
+from skimage.measure import marching_cubes
+
+# ------------------------
+# CONFIG
+# ------------------------
+MODEL_PATH = r"C:\Users\karlo\OneDrive\Desktop\DinoVert\models\model_epoch_2.pth"
+IMAGE_FOLDER = r"C:\Users\karlo\OneDrive\Desktop\Examples\1.3.6.1.4.1.9328.50.4.0016\L3"  # <-- change
+OUTPUT_FILE = r"C:\Users\karlo\OneDrive\Desktop\DinoVert\predicted_L3_mesh.npz"
+VERTEBRA_ID = 2  # L1=0, L2=1, L3=2, L4=3, L5=4
+
+IMAGE_NAMES = [
+    "AP_Caudal_full.png",
+    "AP_Cranial_full.png",
+    "AP_full.png",
+    "LateralLeft_full.png",
+    "LateralRight_full.png",
+    "Oblique_Left_full.png",
+    "Oblique_Right_full.png",
+    "Pedicle_Left_full.png",
+    "Pedicle_Right_full.png"
+]
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ------------------------
+# MODEL (same as training)
+# ------------------------
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        resnet = models.resnet50(weights=None)
+        resnet.fc = nn.Identity()
+        self.model = resnet
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class UNet3D(nn.Module):
+    def __init__(self, input_dim=512):
+        super().__init__()
+        self.fc = nn.Linear(input_dim, 64*8*8*8)
+
+        self.conv1 = nn.Conv3d(64, 64, 3, padding=1)
+        self.conv2 = nn.Conv3d(64, 32, 3, padding=1)
+        self.conv3 = nn.Conv3d(32, 1, 1)
+
+    def forward(self, x):
+        x = self.fc(x)
+        x = x.view(-1, 64, 8, 8, 8)
+
+        x = F.relu(self.conv1(x))
+        x = F.interpolate(x, scale_factor=2)
+        x = F.relu(self.conv2(x))
+        x = F.interpolate(x, scale_factor=2)
+
+        x = torch.sigmoid(self.conv3(x))
+        return x
+
+
+class MultiViewReconstruction(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = FeatureExtractor()
+        self.id_embedding = nn.Embedding(5, 32)
+        self.fusion = nn.Linear(2048 + 32, 512)
+        self.decoder = UNet3D(512)
+
+    def forward(self, views, vertebra_id):
+        feats = []
+
+        for v in views:
+            v = v.unsqueeze(0).to(next(self.parameters()).device)
+            f = self.backbone(v)
+            feats.append(f)
+
+        feats = torch.stack(feats).mean(dim=0)
+
+        id_embed = self.id_embedding(vertebra_id)
+        feats = torch.cat([feats, id_embed], dim=-1)
+
+        fused = self.fusion(feats)
+        volume = self.decoder(fused)
+
+        return volume
+
+
+# ------------------------
+# LOAD IMAGES
+# ------------------------
+def load_image(path):
+    img = Image.open(path).convert("L")
+    img = np.array(img).astype(np.float32) / 255.0
+    img = np.stack([img]*3, axis=0)
+    return torch.tensor(img)
+
+
+def load_views(folder):
+    folder = Path(folder)
+    views = []
+
+    for name in IMAGE_NAMES:
+        img_path = folder / name
+        if img_path.exists():
+            views.append(load_image(img_path))
+
+    print(f"Loaded {len(views)} views")
+    return views
+
+
+# ------------------------
+# VOLUME → MESH
+# ------------------------
+def volume_to_mesh(volume):
+    volume = volume.squeeze().detach().cpu().numpy()
+
+    verts, faces, _, _ = marching_cubes(volume, level=0.5)
+
+    return verts, faces
+
+
+# ------------------------
+# MAIN
+# ------------------------
+def run_inference():
+
+    # load model
+    model = MultiViewReconstruction().to(device)
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model.eval()
+
+    print("Model loaded")
+
+    # load images
+    views = load_views(IMAGE_FOLDER)
+
+    # vertebra ID
+    vertebra_id = torch.tensor([VERTEBRA_ID]).to(device)
+
+    # forward pass
+    with torch.no_grad():
+        pred_volume = model(views, vertebra_id)
+
+    print("Voxel grid shape:", pred_volume.shape)
+
+    # convert to mesh
+    verts, faces = volume_to_mesh(pred_volume)
+
+    print("Mesh:", verts.shape, faces.shape)
+
+    # save
+    np.savez(
+        OUTPUT_FILE,
+        verts=verts,
+        faces=faces
+    )
+
+    print("Saved mesh to:", OUTPUT_FILE)
+
+
+if __name__ == "__main__":
+    run_inference()
