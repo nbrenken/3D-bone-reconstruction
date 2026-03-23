@@ -1,355 +1,301 @@
 import os
-import glob
 import tempfile
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 import nibabel as nib
 import torchio as tio
+import imageio
+import gc
 
 from diffdrr.data import read
 from diffdrr.drr import DRR
-
-# For 3D mesh extraction
 from skimage.measure import marching_cubes
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
 # ============================================================
-# 0) USER SETTINGS
+# SETTINGS
 # ============================================================
-sub_id = "sub-verse141"
-root = "path"
+
+root = r"C:\Users\karlo\OneDrive\Desktop\1kSpineData"
+base_out_dir = r"C:/Users/karlo/OneDrive/Desktop/1kSpineDataxrayspls"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
 
-# In VerSe, lumbar labels are 20..25 = L1..L6, therefore L4 = 23
-L4_LABEL = 23
-
-# DRR geometry
-sdd = 1000.0
-height = 512
-width = 512
-delx = 0.5
-dely = 0.5
-
-# Camera pose
-# Start with the same pose you used before.
-rotation = torch.tensor([[0, 0, 0]], dtype=torch.float32, device=device)
-translation = torch.tensor([[0.0, 850.0, 0.0]], dtype=torch.float32, device=device)
-
-parameterization = "euler_angles"
-convention = "ZXY"
-
-# Visualization settings
-projected_mask_threshold = 1e-6
-mesh_downsample = 1  # keep as 1 unless the mesh is too large
-
-# Output
-out_dir = os.path.join(os.getcwd(), f"outputs_{sub_id}_L4")
-os.makedirs(out_dir, exist_ok=True)
+data_dir = os.path.join(root, "data")
 
 
 # ============================================================
-# 1) FIND FILES
+# LOAD CASES
 # ============================================================
-def find_first_existing(candidates):
-    for p in candidates:
-        if os.path.exists(p):
-            return p
+
+target_folders = ["colon", "liver"]
+
+cases = []
+for folder in target_folders:
+    for root_dir, _, files in os.walk(os.path.join(data_dir, folder)):
+        for f in files:
+            if f.endswith(".nii.gz"):
+                cases.append(os.path.join(root_dir, f))
+
+cases = sorted(cases)
+cases = cases[331:] #due to crash once 
+print("Total CT files:", len(cases))
+
+
+# ============================================================
+# FIND MASK
+# ============================================================
+
+def find_mask(ct_path):
+    mask_path = ct_path.replace(os.sep + "data" + os.sep,
+                               os.sep + "label" + os.sep)
+
+    base = os.path.basename(mask_path).replace(".nii.gz", "")
+    mask_dir = os.path.dirname(mask_path)
+
+    for cand in [
+        base + "_seg.nii.gz",
+        base.replace("_ct", "") + "_seg.nii.gz",
+        base.replace("_ct", "") + ".nii.gz",
+    ]:
+        path = os.path.join(mask_dir, cand)
+        if os.path.exists(path):
+            return path
+
     return None
 
 
-ct_candidates = [
-    os.path.join(root, "rawdata", sub_id, f"{sub_id}_ct.nii.gz"),
-    os.path.join(root, "rawdata", sub_id, f"{sub_id}_dir-orient_ct.nii.gz"),
-]
+# ============================================================
+# SAVE IMAGE
+# ============================================================
 
-mask_candidates = [
-    os.path.join(root, "derivatives", sub_id, f"{sub_id}_seg-vert_msk.nii.gz"),
-    os.path.join(root, "derivatives", sub_id, f"{sub_id}_dir-orient_seg-vert_msk.nii.gz"),
-]
-
-ct_path = find_first_existing(ct_candidates)
-mask_path = find_first_existing(mask_candidates)
-
-if ct_path is None:
-    ct_glob = glob.glob(os.path.join(root, "rawdata", sub_id, "*ct.nii.gz"))
-    if ct_glob:
-        ct_path = ct_glob[0]
-
-if mask_path is None:
-    mask_glob = glob.glob(os.path.join(root, "derivatives", sub_id, "*seg-vert_msk.nii.gz"))
-    if mask_glob:
-        mask_path = mask_glob[0]
-
-if ct_path is None:
-    raise FileNotFoundError(f"Could not find CT for {sub_id}")
-
-if mask_path is None:
-    raise FileNotFoundError(f"Could not find vertebra mask for {sub_id}")
-
-print("CT path:   ", ct_path)
-print("Mask path: ", mask_path)
+def save_png16(path, img):
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    imageio.imwrite(path, (img * 65535).astype(np.uint16))
 
 
 # ============================================================
-# 2) LOAD CT + MASK IN A CONSISTENT SPACE
+# DRR SETTINGS
 # ============================================================
-# We canonicalize both images and resample the mask onto the CT grid.
-# Then we save canonical/aligned temp NIfTI files and read them with DiffDRR.
-ct_img_tio = tio.ScalarImage(ct_path)
-mask_img_tio = tio.LabelMap(mask_path)
 
-to_canonical = tio.ToCanonical()
-ct_img_tio = to_canonical(ct_img_tio)
-mask_img_tio = to_canonical(mask_img_tio)
+height = 256
+width = 256
 
-mask_img_tio = tio.Resample(ct_img_tio)(mask_img_tio)
+sdd = 1200
+delx = 0.5
+dely = 0.5
 
-ct_tensor = ct_img_tio.data.clone().float()       # shape: (1, X, Y, Z) in TorchIO convention
-mask_tensor = mask_img_tio.data.clone().float()
+parameterization = "euler_angles"
+convention = "ZYX"
 
-print("Canonical CT tensor shape:   ", tuple(ct_tensor.shape))
-print("Canonical mask tensor shape: ", tuple(mask_tensor.shape))
-
-if ct_tensor.shape != mask_tensor.shape:
-    raise RuntimeError(
-        f"CT and mask tensors do not match after canonicalization/resampling: "
-        f"{tuple(ct_tensor.shape)} vs {tuple(mask_tensor.shape)}"
-    )
-
-ct_np = ct_tensor.squeeze(0).cpu().numpy().astype(np.float32)
-mask_np = mask_tensor.squeeze(0).cpu().numpy().astype(np.int16)
-
-print("CT stats:", ct_np.shape, ct_np.dtype, float(ct_np.min()), float(ct_np.max()))
-print("Mask labels present:", np.unique(mask_np)[:20], "...")
-
-# Extract L4 mask
-l4_mask_np = (mask_np == L4_LABEL).astype(np.float32)
-
-if l4_mask_np.sum() == 0:
-    raise RuntimeError(
-        f"No voxels with label {L4_LABEL} found. "
-        f"Check whether this subject contains L4 and whether the mask is correct."
-    )
-
-# L4-only attenuation volume:
-# keep CT intensities only inside L4
-l4_ct_np = ct_np * l4_mask_np
+translation = torch.tensor([[0.0, 1200, 0]], dtype=torch.float32, device=device)
 
 
 # ============================================================
-# 3) SAVE TEMP NIFTI FILES FOR DiffDRR
+# VIEWS
 # ============================================================
-# Using the canonical CT affine keeps all volumes aligned in physical space.
-tmp_dir = tempfile.mkdtemp(prefix=f"{sub_id}_l4_tmp_")
-print("Temporary directory:", tmp_dir)
 
-ct_aligned_path = os.path.join(tmp_dir, f"{sub_id}_ct_canonical.nii.gz")
-l4_ct_path = os.path.join(tmp_dir, f"{sub_id}_L4_ct_only.nii.gz")
-l4_mask_path = os.path.join(tmp_dir, f"{sub_id}_L4_mask.nii.gz")
+def jitter(base, z=3, y=5, x=2):
+    return [
+        base[0] + np.random.uniform(-z, z),
+        base[1] + np.random.uniform(-y, y),
+        base[2] + np.random.uniform(-x, x),
+    ]
 
-nib.save(nib.Nifti1Image(ct_np, ct_img_tio.affine), ct_aligned_path)
-nib.save(nib.Nifti1Image(l4_ct_np.astype(np.float32), ct_img_tio.affine), l4_ct_path)
-nib.save(nib.Nifti1Image(l4_mask_np.astype(np.float32), ct_img_tio.affine), l4_mask_path)
+views_deg = {
+    "AP": jitter([0, 0, 0]),
+    "LateralLeft": jitter([90, 0, 0]),
+    "LateralRight": jitter([-90, 0, 0]),
+    "Oblique_Left": jitter([45, 0, 0]),
+    "Oblique_Right": jitter([-45, 0, 0]),
+    "Pedicle_Left": jitter([30, 5, 0]),
+    "Pedicle_Right": jitter([-30, 5, 0]),
+    "AP_Cranial": jitter([0, 10, 0]),
+    "AP_Caudal": jitter([0, -10, 0]),
+}
 
+view_names = list(views_deg.keys())
 
-# ============================================================
-# 4) LOAD WITH DiffDRR
-# ============================================================
-ct_subject = read(ct_aligned_path)
-l4_ct_subject = read(l4_ct_path)
-l4_mask_subject = read(l4_mask_path)
-
-
-# ============================================================
-# 5) BUILD RENDERERS
-# ============================================================
-ct_renderer = DRR(
-    ct_subject,
-    sdd=sdd,
-    height=height,
-    width=width,
-    delx=delx,
-    dely=dely,
+rotations = torch.from_numpy(
+    np.array([np.deg2rad(v) for v in views_deg.values()], dtype=np.float32)
 ).to(device)
 
-l4_ct_renderer = DRR(
-    l4_ct_subject,
-    sdd=sdd,
-    height=height,
-    width=width,
-    delx=delx,
-    dely=dely,
-).to(device)
-
-l4_mask_renderer = DRR(
-    l4_mask_subject,
-    sdd=sdd,
-    height=height,
-    width=width,
-    delx=delx,
-    dely=dely,
-).to(device)
+translations = translation.repeat(len(view_names), 1)
 
 
 # ============================================================
-# 6) RENDER FULL DRR + L4-ONLY DRR + PROJECTED L4 MASK
+# HELPERS
 # ============================================================
-with torch.no_grad():
-    full_ct_proj = ct_renderer(
-        rotation,
-        translation,
-        parameterization=parameterization,
-        convention=convention,
+
+def compute_bbox(mask, margin=250):
+    coords = np.argwhere(mask > 0)
+    min_x, min_y, min_z = coords.min(axis=0)
+    max_x, max_y, max_z = coords.max(axis=0)
+
+    return (
+        max(min_x - margin, 0),
+        min(max_x + margin, mask.shape[0]),
+        max(min_y - margin, 0),
+        min(max_y + margin, mask.shape[1]),
+        max(min_z - margin, 0),
+        min(max_z + margin, mask.shape[2]),
     )
 
-    l4_ct_proj = l4_ct_renderer(
-        rotation,
-        translation,
-        parameterization=parameterization,
-        convention=convention,
-    )
 
-    l4_mask_proj = l4_mask_renderer(
-        rotation,
-        translation,
-        parameterization=parameterization,
-        convention=convention,
-    )
-
-full_drr = full_ct_proj[0].detach().cpu().squeeze().numpy().astype(np.float32)
-l4_drr = l4_ct_proj[0].detach().cpu().squeeze().numpy().astype(np.float32)
-l4_proj_mask = l4_mask_proj[0].detach().cpu().squeeze().numpy().astype(np.float32)
-
-def normalize_image(img):
-    img = img.astype(np.float32)
-    return (img - img.min()) / (img.max() - img.min() + 1e-8)
-
-full_drr_disp = normalize_image(full_drr)
-l4_drr_disp = normalize_image(l4_drr)
-
-# Binarize the projected mask
-l4_proj_mask_disp = (l4_proj_mask > projected_mask_threshold).astype(np.float32)
+label_to_name = {
+    20: "L1",
+    21: "L2",
+    22: "L3",
+    23: "L4",
+    24: "L5",
+}
 
 
 # ============================================================
-# 7) 3D MESH OF L4
+# TEMP DIR
 # ============================================================
-# Nibabel spacing order comes from header zooms
-zooms = ct_img_tio.spacing  # (sx, sy, sz)
-sx, sy, sz = float(zooms[0]), float(zooms[1]), float(zooms[2])
 
-mask_for_mesh = l4_mask_np
-if mesh_downsample > 1:
-    mask_for_mesh = mask_for_mesh[::mesh_downsample, ::mesh_downsample, ::mesh_downsample]
-    sx *= mesh_downsample
-    sy *= mesh_downsample
-    sz *= mesh_downsample
-
-verts, faces, normals, values = marching_cubes(
-    mask_for_mesh,
-    level=0.5,
-    spacing=(sx, sy, sz),
-)
-
-print("Mesh vertices:", verts.shape)
-print("Mesh faces:   ", faces.shape)
+tmp_dir = tempfile.mkdtemp(prefix="drr_tmp_")
 
 
 # ============================================================
-# 8) DISPLAY: 2D RESULTS
+# MAIN LOOP
 # ============================================================
-fig, axs = plt.subplots(1, 3, figsize=(18, 6))
 
-axs[0].imshow(full_drr_disp, cmap="gray")
-axs[0].set_title("Full synthetic X-ray (whole CT)")
-axs[0].axis("off")
+for ct_path in cases:
 
-axs[1].imshow(l4_drr_disp, cmap="gray")
-axs[1].set_title("L4-only synthetic X-ray")
-axs[1].axis("off")
+    case_id = os.path.basename(ct_path).replace(".nii.gz", "")
+    print("\nProcessing:", case_id)
 
-axs[2].imshow(full_drr_disp, cmap="gray")
-axs[2].imshow(l4_proj_mask_disp, cmap="autumn", alpha=0.35)
-axs[2].set_title("Full DRR + projected L4 mask")
-axs[2].axis("off")
+    mask_path = find_mask(ct_path)
+    if mask_path is None:
+        continue
 
-plt.tight_layout()
-plt.show()
+    subject_out_dir = os.path.join(base_out_dir, case_id)
+    os.makedirs(subject_out_dir, exist_ok=True)
+    
+
+    ct_img = tio.ScalarImage(ct_path)
+    mask_img = tio.LabelMap(mask_path)
+
+    ct_img = tio.ToCanonical()(ct_img)
+    mask_img = tio.ToCanonical()(mask_img)
+    mask_img = tio.Resample(ct_img)(mask_img)
+
+    ct_np = ct_img.data.squeeze().numpy().astype(np.float32)
+    mask_np = mask_img.data.squeeze().numpy().astype(np.int16)
+
+    labels_present = np.unique(mask_np)
+
+    if not any(l in labels_present for l in label_to_name):
+        continue
+
+    affine = ct_img.affine.copy()
+
+    for label, name in label_to_name.items():
+
+        if label not in labels_present:
+            continue
+
+        print("  ", name)
+        vert_mask = (mask_np == label)
+
+        min_x, max_x, min_y, max_y, min_z, max_z = compute_bbox(vert_mask)
+
+        submask = vert_mask[min_x:max_x, min_y:max_y, min_z:max_z]
+        ct_crop = ct_np[min_x:max_x, min_y:max_y, min_z:max_z]
+        vert_crop = ct_crop * submask
+
+        # ====================================================
+        # MESH + PCA ALIGNMENT
+        # ====================================================
+
+        try:
+            verts, faces, _, _ = marching_cubes(submask, level=0.5, spacing=ct_img.spacing)
+
+            # CENTER
+            verts -= verts.mean(axis=0)
+
+            # PCA ALIGNMENT
+            cov = np.cov(verts.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            order = np.argsort(eigvals)[::-1]
+            eigvecs = eigvecs[:, order]
+            verts = verts @ eigvecs
+
+            # SIGN FIX (CRITICAL)
+            for i in range(3):
+                if verts[:, i].mean() < 0:
+                    verts[:, i] *= -1
+
+            # NORMALIZE
+            verts /= np.max(np.linalg.norm(verts, axis=1))
+
+            mesh_path = os.path.join(subject_out_dir, name, f"{name}_mesh.npz")
+            os.makedirs(os.path.dirname(mesh_path), exist_ok=True)
+
+            np.savez_compressed(mesh_path, verts=verts, faces=faces)
+
+        except Exception as e:
+            print("Mesh failed:", e)
+
+        # ====================================================
+        # DRR
+        # ====================================================
+
+        full_path = os.path.join(tmp_dir, f"{case_id}_{name}_full.nii.gz")
+        vert_path = os.path.join(tmp_dir, f"{case_id}_{name}_vert.nii.gz")
+
+        nib.save(nib.Nifti1Image(ct_crop, affine), full_path)
+        nib.save(nib.Nifti1Image(vert_crop, affine), vert_path)
+
+        renderer_full = DRR(read(full_path), sdd=sdd,
+                            height=height, width=width,
+                            delx=delx, dely=dely).to(device)
+
+        renderer_vert = DRR(read(vert_path), sdd=sdd,
+                            height=height, width=width,
+                            delx=delx, dely=dely).to(device)
+
+        full_list, vert_list = [], []
+
+        for i in range(len(view_names)):
+
+            rot = rotations[i:i+1]
+            trans = translations[i:i+1]
+
+            with torch.no_grad():
+                full_batch = renderer_full(rot, trans,
+                                           parameterization=parameterization,
+                                           convention=convention)
+
+                vert_batch = renderer_vert(rot, trans,
+                                           parameterization=parameterization,
+                                           convention=convention)
+
+            full_list.append(full_batch.cpu())
+            vert_list.append(vert_batch.cpu())
+
+        full = torch.cat(full_list).numpy()
+        vert = torch.cat(vert_list).numpy()
+
+        out_dir = os.path.join(subject_out_dir, name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        for i, view in enumerate(view_names):
+            f = full[i].squeeze()
+            v = vert[i].squeeze()
+            m = (v > 0.1).astype(np.float32)
+
+            save_png16(os.path.join(out_dir, f"{view}_full.png"), f)
+            save_png16(os.path.join(out_dir, f"{view}_vert.png"), v)
+            imageio.imwrite(os.path.join(out_dir, f"{view}_mask.png"), (m * 255).astype(np.uint8))
+
+        del renderer_full, renderer_vert
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
-# ============================================================
-# 9) DISPLAY: 3D MESH
-# ============================================================
-fig = plt.figure(figsize=(8, 8))
-ax = fig.add_subplot(111, projection="3d")
-
-mesh = Poly3DCollection(verts[faces], alpha=0.9)
-mesh.set_edgecolor("none")
-ax.add_collection3d(mesh)
-
-# Set limits
-x_min, y_min, z_min = verts.min(axis=0)
-x_max, y_max, z_max = verts.max(axis=0)
-ax.set_xlim(x_min, x_max)
-ax.set_ylim(y_min, y_max)
-ax.set_zlim(z_min, z_max)
-
-# Better aspect ratio
-max_range = np.array([x_max - x_min, y_max - y_min, z_max - z_min]).max()
-mid_x = (x_max + x_min) / 2
-mid_y = (y_max + y_min) / 2
-mid_z = (z_max + z_min) / 2
-ax.set_xlim(mid_x - max_range / 2, mid_x + max_range / 2)
-ax.set_ylim(mid_y - max_range / 2, mid_y + max_range / 2)
-ax.set_zlim(mid_z - max_range / 2, mid_z + max_range / 2)
-
-ax.set_title("3D surface mesh of L4")
-ax.set_xlabel("x (mm)")
-ax.set_ylabel("y (mm)")
-ax.set_zlabel("z (mm)")
-ax.view_init(elev=20, azim=45)
-
-plt.tight_layout()
-plt.show()
-
-
-# ============================================================
-# 10) SAVE OUTPUTS
-# ============================================================
-plt.imsave(os.path.join(out_dir, "full_ct_drr.png"), full_drr_disp, cmap="gray")
-plt.imsave(os.path.join(out_dir, "l4_only_drr.png"), l4_drr_disp, cmap="gray")
-plt.imsave(os.path.join(out_dir, "l4_projected_mask.png"), l4_proj_mask_disp, cmap="gray")
-
-fig, ax = plt.subplots(figsize=(6, 6))
-ax.imshow(full_drr_disp, cmap="gray")
-ax.imshow(l4_proj_mask_disp, cmap="autumn", alpha=0.35)
-ax.set_title("Full DRR + projected L4 mask")
-ax.axis("off")
-fig.tight_layout()
-fig.savefig(os.path.join(out_dir, "overlay_full_drr_l4mask.png"), bbox_inches="tight", pad_inches=0)
-plt.close(fig)
-
-fig = plt.figure(figsize=(8, 8))
-ax = fig.add_subplot(111, projection="3d")
-mesh = Poly3DCollection(verts[faces], alpha=0.9)
-mesh.set_edgecolor("none")
-ax.add_collection3d(mesh)
-
-ax.set_xlim(mid_x - max_range / 2, mid_x + max_range / 2)
-ax.set_ylim(mid_y - max_range / 2, mid_y + max_range / 2)
-ax.set_zlim(mid_z - max_range / 2, mid_z + max_range / 2)
-ax.set_title("3D surface mesh of L4")
-ax.set_xlabel("x (mm)")
-ax.set_ylabel("y (mm)")
-ax.set_zlabel("z (mm)")
-ax.view_init(elev=20, azim=45)
-
-fig.tight_layout()
-fig.savefig(os.path.join(out_dir, "l4_mesh.png"), dpi=200)
-plt.close(fig)
-
-print(f"\nSaved outputs to:\n{out_dir}")
-print(f"Temporary aligned NIfTI files are in:\n{tmp_dir}")
+print("\n DONE")
