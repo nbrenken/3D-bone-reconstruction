@@ -1,0 +1,355 @@
+import os
+import tempfile
+import numpy as np
+import torch
+import nibabel as nib
+import torchio as tio
+import imageio
+import gc
+
+from diffdrr.data import read
+from diffdrr.drr import DRR
+from skimage.measure import marching_cubes
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+root = r"C:\Users\karlo\OneDrive\Desktop\1kSpineData"
+base_out_dir = r"C:/Users/karlo/OneDrive/Desktop/1kSpineDataxray2"
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+data_dir = os.path.join(root, "data")
+
+
+# ============================================================
+# LOAD CASES
+# ============================================================
+
+target_folders = ["colon", "liver"]
+
+cases = []
+for folder in target_folders:
+    for root_dir, _, files in os.walk(os.path.join(data_dir, folder)):
+        for f in files:
+            if f.endswith(".nii.gz"):
+                cases.append(os.path.join(root_dir, f))
+
+cases = sorted(cases)
+#cases = cases[331:] #in case of crash 
+print("Total CT files:", len(cases))
+
+
+# ============================================================
+# FIND MASK
+# ============================================================
+
+def find_mask(ct_path):
+    mask_path = ct_path.replace(os.sep + "data" + os.sep,
+                               os.sep + "label" + os.sep)
+
+    base = os.path.basename(mask_path).replace(".nii.gz", "")
+    mask_dir = os.path.dirname(mask_path)
+
+    for cand in [
+        base + "_seg.nii.gz",
+        base.replace("_ct", "") + "_seg.nii.gz",
+        base.replace("_ct", "") + ".nii.gz",
+    ]:
+        path = os.path.join(mask_dir, cand)
+        if os.path.exists(path):
+            return path
+
+    return None
+
+
+# ============================================================
+# SAVE IMAGE
+# ============================================================
+
+def save_png16(path, img):
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    imageio.imwrite(path, (img * 65535).astype(np.uint16))
+
+
+# ============================================================
+# DRR SETTINGS
+# ============================================================
+
+height = 256
+width = 256
+
+sdd = 1200
+delx = 0.5
+dely = 0.5
+
+parameterization = "euler_angles"
+convention = "ZYX"
+
+
+# ============================================================
+# VIEWS
+# ============================================================
+
+def jitter(base, z=3, y=5, x=2):
+    return [
+        base[0] + np.random.uniform(-z, z),
+        base[1] + np.random.uniform(-y, y),
+        base[2] + np.random.uniform(-x, x),
+    ]
+
+views_deg = {
+    "AP": jitter([0, 0, 0]),
+    "LateralLeft": jitter([90, 0, 0]),
+    "LateralRight": jitter([-90, 0, 0]),
+    "Oblique_Left": jitter([45, 0, 0]),
+    "Oblique_Right": jitter([-45, 0, 0]),
+    "Pedicle_Left": jitter([30, 5, 0]),
+    "Pedicle_Right": jitter([-30, 5, 0]),
+    "AP_Cranial": jitter([0, 10, 0]),
+    "AP_Caudal": jitter([0, -10, 0]),
+}
+
+view_names = list(views_deg.keys())
+
+translation = torch.tensor([[0.0, 1200, 0]], dtype=torch.float32, device=device)
+translations = translation.repeat(len(view_names), 1)
+
+rotations = torch.from_numpy(
+    np.array([np.deg2rad(v) for v in views_deg.values()], dtype=np.float32)
+).to(device)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def compute_bbox(mask, margin=250):
+    coords = np.argwhere(mask > 0)
+    min_x, min_y, min_z = coords.min(axis=0)
+    max_x, max_y, max_z = coords.max(axis=0)
+
+    return (
+        max(min_x - margin, 0),
+        min(max_x + margin, mask.shape[0]),
+        max(min_y - margin, 0),
+        min(max_y + margin, mask.shape[1]),
+        max(min_z - margin, 0),
+        min(max_z + margin, mask.shape[2]),
+    )
+
+
+label_to_name = {
+    20: "L1",
+    21: "L2",
+    22: "L3",
+    23: "L4",
+    24: "L5",
+}
+
+
+# ============================================================
+# TEMP DIR
+# ============================================================
+
+tmp_dir = tempfile.mkdtemp(prefix="drr_tmp_")
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
+for ct_path in cases:
+
+    case_id = os.path.basename(ct_path).replace(".nii.gz", "")
+    print("\nProcessing:", case_id)
+
+    mask_path = find_mask(ct_path)
+    if mask_path is None:
+        continue
+
+    subject_out_dir = os.path.join(base_out_dir, case_id)
+    os.makedirs(subject_out_dir, exist_ok=True)
+    
+
+    ct_img = tio.ScalarImage(ct_path)
+    mask_img = tio.LabelMap(mask_path)
+
+    ct_img = tio.ToCanonical()(ct_img)
+    mask_img = tio.ToCanonical()(mask_img)
+    mask_img = tio.Resample(ct_img)(mask_img)
+
+    ct_np = ct_img.data.squeeze().numpy().astype(np.float32)
+    mask_np = mask_img.data.squeeze().numpy().astype(np.int16)
+
+    labels_present = np.unique(mask_np)
+
+    if not any(l in labels_present for l in label_to_name):
+        continue
+
+    affine = ct_img.affine.copy()
+
+    for label, name in label_to_name.items():
+
+        if label not in labels_present:
+            continue
+
+        print("  ", name)
+        vert_mask = (mask_np == label)
+
+        min_x, max_x, min_y, max_y, min_z, max_z = compute_bbox(vert_mask)
+
+        # FIRST crop
+        submask = vert_mask[min_x:max_x, min_y:max_y, min_z:max_z]
+        ct_crop = ct_np[min_x:max_x, min_y:max_y, min_z:max_z]
+
+        # ====================================================
+        # HARD CENTERING IN VOXEL SPACE
+        # ====================================================
+
+        coords = np.argwhere(submask > 0)
+        center_voxel = coords.mean(axis=0)
+
+        vol_center = np.array(submask.shape) / 2.0
+        shift = (vol_center - center_voxel).astype(int)
+
+        # create empty arrays
+        ct_centered = np.zeros_like(ct_crop)
+        mask_centered = np.zeros_like(submask)
+
+        # compute valid slicing ranges
+        src_x0 = max(0, -shift[0])
+        src_x1 = min(submask.shape[0], submask.shape[0] - shift[0])
+
+        src_y0 = max(0, -shift[1])
+        src_y1 = min(submask.shape[1], submask.shape[1] - shift[1])
+
+        src_z0 = max(0, -shift[2])
+        src_z1 = min(submask.shape[2], submask.shape[2] - shift[2])
+
+        dst_x0 = max(0, shift[0])
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+
+        dst_y0 = max(0, shift[1])
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+
+        dst_z0 = max(0, shift[2])
+        dst_z1 = dst_z0 + (src_z1 - src_z0)
+
+        # apply shift
+        ct_centered[dst_x0:dst_x1, dst_y0:dst_y1, dst_z0:dst_z1] = \
+            ct_crop[src_x0:src_x1, src_y0:src_y1, src_z0:src_z1]
+
+        mask_centered[dst_x0:dst_x1, dst_y0:dst_y1, dst_z0:dst_z1] = \
+            submask[src_x0:src_x1, src_y0:src_y1, src_z0:src_z1]
+
+        # overwrite with centered data
+        ct_crop = ct_centered
+        submask = mask_centered
+        bone_threshold = 15  # try 150–300
+
+        ct_bone = ct_crop.copy()
+        ct_bone[ct_bone < bone_threshold] = 0
+
+        vert_crop = ct_bone * submask
+        ct_crop = ct_bone
+
+        
+
+
+
+        # ====================================================
+        # MESH + PCA ALIGNMENT
+        # ====================================================
+
+        try:
+            verts, faces, _, _ = marching_cubes(submask, level=0.5, spacing=ct_img.spacing)
+
+            # CENTER
+            verts -= verts.mean(axis=0)
+
+            # PCA ALIGNMENT
+            cov = np.cov(verts.T)
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            order = np.argsort(eigvals)[::-1]
+            eigvecs = eigvecs[:, order]
+            verts = verts @ eigvecs
+
+            # SIGN FIX (CRITICAL)
+            for i in range(3):
+                if verts[:, i].mean() < 0:
+                    verts[:, i] *= -1
+
+            # NORMALIZE
+            verts /= np.max(np.linalg.norm(verts, axis=1))
+
+            mesh_path = os.path.join(subject_out_dir, name, f"{name}_mesh.npz")
+            os.makedirs(os.path.dirname(mesh_path), exist_ok=True)
+
+            np.savez_compressed(mesh_path, verts=verts, faces=faces)
+
+        except Exception as e:
+            print("Mesh failed:", e)
+
+        # ====================================================
+        # DRR
+        # ====================================================
+
+        full_path = os.path.join(tmp_dir, f"{case_id}_{name}_full.nii.gz")
+        vert_path = os.path.join(tmp_dir, f"{case_id}_{name}_vert.nii.gz")
+
+        nib.save(nib.Nifti1Image(ct_crop, affine), full_path)
+        nib.save(nib.Nifti1Image(vert_crop, affine), vert_path)
+
+        renderer_full = DRR(read(full_path), sdd=sdd,
+                            height=height, width=width,
+                            delx=delx, dely=dely).to(device)
+
+        renderer_vert = DRR(read(vert_path), sdd=sdd,
+                            height=height, width=width,
+                            delx=delx, dely=dely).to(device)
+
+        full_list, vert_list = [], []
+
+        for i in range(len(view_names)):
+
+            rot = rotations[i:i+1]
+            trans = translations[i:i+1]
+
+            with torch.no_grad():
+                full_batch = renderer_full(rot, trans,
+                                           parameterization=parameterization,
+                                           convention=convention)
+
+                vert_batch = renderer_vert(rot, trans,
+                                           parameterization=parameterization,
+                                           convention=convention)
+
+            full_list.append(full_batch.cpu())
+            vert_list.append(vert_batch.cpu())
+
+        full = torch.cat(full_list).numpy()
+        vert = torch.cat(vert_list).numpy()
+
+        out_dir = os.path.join(subject_out_dir, name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        for i, view in enumerate(view_names):
+            f = full[i].squeeze()
+            v = vert[i].squeeze()
+            m = (v > 0.1).astype(np.float32)
+
+            save_png16(os.path.join(out_dir, f"{view}_full.png"), f)
+            save_png16(os.path.join(out_dir, f"{view}_vert.png"), v)
+            imageio.imwrite(os.path.join(out_dir, f"{view}_mask.png"), (m * 255).astype(np.uint8))
+
+        del renderer_full, renderer_vert
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+print("\n DONE")
