@@ -1,0 +1,963 @@
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+from torch.utils.data import Subset
+import numpy as np
+import trimesh
+from pathlib import Path
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import PIL.Image as Image
+import torchvision.models as models
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.model_selection import train_test_split
+from scipy.ndimage import binary_fill_holes
+import os
+
+
+
+    
+def plot_voxel_grid_3d(voxels: np.ndarray, max_points: int = 20000):
+    """Plot a voxel grid as a sampled point cloud for interactive speed."""
+    filled = voxels.astype(bool)
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    filled_count = int(filled.sum())
+    if filled_count == 0:
+        print("Voxel grid is empty; nothing to plot.")
+        return
+
+    coords = np.argwhere(filled)
+    if coords.shape[0] > max_points:
+        sample_idx = np.random.choice(coords.shape[0], size=max_points, replace=False)
+        coords = coords[sample_idx]
+        print(f"Showing {max_points}/{filled_count} occupied voxels for faster rendering.")
+
+    ax.scatter(
+        coords[:, 0].tolist(),
+        coords[:, 1].tolist(),
+        coords[:, 2].tolist(),
+        s=1,
+        c="steelblue",
+        alpha=0.8,
+    )
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_box_aspect(filled.shape)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_voxel_fixed_view_3d(
+    voxels: np.ndarray,
+    max_points: int = 200000,
+    elev: float = 20,
+    azim: float = 35,
+    save_path: str = "voxel_fixed_view.png",
+    show: bool = False,
+):
+    """Render a fixed-angle 3D voxel view and optionally save it without interaction."""
+    filled = np.squeeze(voxels).astype(bool)
+    if filled.ndim != 3:
+        raise ValueError(f"plot_voxel_fixed_view_3d expects a 3D voxel grid after squeeze, got shape {filled.shape}")
+
+    filled_count = int(filled.sum())
+    if filled_count == 0:
+        print("Voxel grid is empty; nothing to plot.")
+        return
+
+    coords = np.argwhere(filled)
+    if coords.shape[0] > max_points:
+        sample_idx = np.random.choice(coords.shape[0], size=max_points, replace=False)
+        coords = coords[sample_idx]
+        print(f"Showing {max_points}/{filled_count} occupied voxels for faster rendering.")
+
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(
+        coords[:, 0].tolist(),
+        coords[:, 1].tolist(),
+        coords[:, 2].tolist(),
+        s=1,
+        c="steelblue",
+        alpha=0.8,
+    )
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_title("Voxel Grid (Fixed 3D View)")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_box_aspect(filled.shape)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200)
+        print(f"Saved fixed-view 3D plot to {save_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
+def plot_voxel_comparison_fixed_view_3d(
+    prediction_voxels: np.ndarray,
+    ground_truth_voxels: np.ndarray,
+    max_points: int = 200000,
+    elev: float = 20,
+    azim: float = 35,
+    save_path: str = "voxel_comparison_fixed_view.png",
+):
+    """Render prediction and ground truth side-by-side in one non-interactive figure."""
+    pred = np.squeeze(prediction_voxels).astype(bool)
+    gt = np.squeeze(ground_truth_voxels).astype(bool)
+
+    if pred.ndim != 3:
+        raise ValueError(f"plot_voxel_comparison_fixed_view_3d expects prediction to be 3D after squeeze, got shape {pred.shape}")
+    if gt.ndim != 3:
+        raise ValueError(f"plot_voxel_comparison_fixed_view_3d expects ground truth to be 3D after squeeze, got shape {gt.shape}")
+
+    pred_coords = np.argwhere(pred)
+    gt_coords = np.argwhere(gt)
+
+    if pred_coords.shape[0] == 0 and gt_coords.shape[0] == 0:
+        print("Both voxel grids are empty; nothing to plot.")
+        return
+
+    if pred_coords.shape[0] > max_points:
+        sample_idx = np.random.choice(pred_coords.shape[0], size=max_points, replace=False)
+        pred_coords = pred_coords[sample_idx]
+        print(f"Prediction: showing {max_points}/{int(pred.sum())} occupied voxels for faster rendering.")
+
+    if gt_coords.shape[0] > max_points:
+        sample_idx = np.random.choice(gt_coords.shape[0], size=max_points, replace=False)
+        gt_coords = gt_coords[sample_idx]
+        print(f"Ground truth: showing {max_points}/{int(gt.sum())} occupied voxels for faster rendering.")
+
+    fig = plt.figure(figsize=(14, 7))
+    ax_pred = fig.add_subplot(121, projection="3d")
+    ax_gt = fig.add_subplot(122, projection="3d")
+
+    if pred_coords.shape[0] > 0:
+        ax_pred.scatter(
+            pred_coords[:, 0].tolist(),
+            pred_coords[:, 1].tolist(),
+            pred_coords[:, 2].tolist(),
+            s=1,
+            c="tomato",
+            alpha=0.8,
+        )
+
+    if gt_coords.shape[0] > 0:
+        ax_gt.scatter(
+            gt_coords[:, 0].tolist(),
+            gt_coords[:, 1].tolist(),
+            gt_coords[:, 2].tolist(),
+            s=1,
+            c="steelblue",
+            alpha=0.8,
+        )
+
+    ax_pred.set_title("Prediction")
+    ax_gt.set_title("Ground Truth")
+
+    for ax, shape in ((ax_pred, pred.shape), (ax_gt, gt.shape)):
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.set_box_aspect(shape)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=200)
+        print(f"Saved side-by-side fixed-view plot to {save_path}")
+    plt.close(fig)
+
+
+class BackprojectionModule(nn.Module):
+    def __init__(self, grid_size=80, world_size=125.0):
+        super().__init__()
+        lin = torch.linspace(-world_size/2, world_size/2, grid_size)
+        x, y, z = torch.meshgrid(lin, lin, lin, indexing='ij')
+        X_hom = torch.stack([x.reshape(-1), y.reshape(-1), z.reshape(-1), torch.ones(grid_size**3)], dim=0)
+        self.register_buffer('X_hom', X_hom)  # moves with model to GPU, created once
+        self.grid_size = grid_size
+
+    def forward(self, features, projection_matrices, image_size=256):
+        N, C, H, W = features.shape
+        view_grids = []
+        for i in range(N):
+            P = projection_matrices[i]
+            feat = features[i]
+            X_proj = P @ self.X_hom
+            depth = X_proj[2].clamp(min=1e-8)
+            p_x = (X_proj[0] / depth / (image_size - 1)) * 2.0 - 1.0
+            p_y = (X_proj[1] / depth / (image_size - 1)) * 2.0 - 1.0
+            sample_grid = torch.stack([p_x, p_y], dim=-1).reshape(1, 1, -1, 2)
+            sampled = F.grid_sample(feat.unsqueeze(0), sample_grid, mode='bilinear',
+                                    padding_mode='zeros', align_corners=True).squeeze(0).squeeze(1)
+            view_grids.append(sampled.reshape(C, self.grid_size, self.grid_size, self.grid_size))
+        return torch.stack(view_grids, dim=0)
+
+
+class SpineDataset(Dataset):
+    def __init__(self, drr_dir: Path, cache_dir: Path, transform=None):
+        self.drr_dir = drr_dir
+        self.cache_dir = cache_dir
+        self.transform = transform or transforms.ToTensor()
+        self.samples = []
+        self.vertebra_to_idx = {}
+        current_idx = 0
+
+        # --- STEP 1: LOAD SAMPLES ---
+        for patient in self.drr_dir.iterdir():
+            if patient.is_dir():
+                for vertebra in patient.iterdir():
+                    if vertebra.is_dir():
+                        if vertebra.name == "L5": #Lil note: L5 removed because of bad data
+                            continue
+                        mesh_files = list(vertebra.glob("*.npz"))
+                        if not mesh_files:
+                            continue
+
+                        cache_path = self.cache_dir / f"{patient.name}_{vertebra.name}.npy"
+                        if not cache_path.exists():
+                            continue
+
+                        self.samples.append({
+                            "patient": patient.name,
+                            "vertebra": vertebra.name,
+                            "mesh_file": mesh_files[0],
+                            "drr_files": [drr_file for drr_file in sorted(vertebra.glob("*full.png"))],
+                        })
+
+
+        # --- STEP 2: BUILD VERTEBRA INDEX ---
+        self.vertebra_to_idx = {}
+        current_idx = 0
+
+        for sample in self.samples:
+            v = sample["vertebra"]
+            if v not in self.vertebra_to_idx:
+                self.vertebra_to_idx[v] = current_idx
+                current_idx += 1
+
+        print("Vertebra mapping:", self.vertebra_to_idx)
+
+
+
+        for sample in self.samples:
+            v = sample["vertebra"]
+            if v not in self.vertebra_to_idx:
+                self.vertebra_to_idx[v] = current_idx
+                current_idx += 1
+
+
+        K = [[2400, 0, 128],[0, 2400, 128],[0, 0, 1]]
+        SDD = 1200.0
+
+        def make_P(R, t_world, K):
+            """
+            R: rotation from world to camera coordinates
+            t_world: camera position in world coordinates (3,1)
+            P = K @ R @ [I | -t_world]
+            """
+            R = np.array(R, dtype=np.float64)
+            t_world = np.array(t_world, dtype=np.float64).reshape(3, 1)
+            P = K @ R @ np.hstack((np.eye(3), -t_world))
+            return P
+
+        # AP: camera at (0, 0, -SDD), looking along +Z
+        # World-to-camera: Z_world -> Z_cam (optical axis), X_world -> X_cam, Y_world -> Y_cam
+        R_AP = [[1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1]]
+        t_AP = [0, 0, -SDD]
+
+        # Lateral Left: camera at (-SDD, 0, 0), looking along +X
+        # Camera z-axis = world x-axis, camera x-axis = world -z-axis, camera y-axis = world y-axis
+                # Lateral Left: camera at (-SDD, 0, 0), looking along +X
+        # cam_z = [1, 0, 0]  (optical axis, toward origin)
+        # cam_y = [0, 1, 0]  (image vertical = world Y)
+        # cam_x = cam_y × cam_z = [0,1,0] × [1,0,0] = [0,0,-1]
+        # det check: needed
+        R_LateralLeft = np.array([[0, 0, -1],
+                                [0, 1,  0],
+                                [1, 0,  0]])
+        t_LateralLeft = [-SDD, 0, 0]
+        # det = 0(0-0) - 0(0-(-1)) + (-1)(0-1) = +1 ✓
+
+        # Lateral Right: camera at (+SDD, 0, 0), looking along -X
+        # cam_z = [-1, 0, 0]
+        # cam_y = [0, 1, 0]
+        # cam_x = cam_y × cam_z = [0,1,0] × [-1,0,0] = [0,0,1]
+        R_LateralRight = np.array([[0,  0, 1],
+                                [0,  1, 0],
+                                [-1, 0, 0]])
+        t_LateralRight = [SDD, 0, 0]
+        # det = 0(0-0) - 0(0-(-1)) + 1(0-(-1)) = +1 ✓
+
+        # Oblique Left 45°: camera rotated 45° from AP toward left lateral
+        # Camera is at position rotated -45° around Y from AP position
+        angle = np.radians(45)
+        ca, sa = np.cos(angle), np.sin(angle)
+        # Camera position: rotate (0,0,-SDD) by -45° around Y
+        t_ObliqueLeft = [-SDD * sa, 0, -SDD * ca]
+        # R rotates world to camera: camera looks toward origin from t
+        # Camera z-axis (optical) points from t toward origin = -t/|t| in world
+        # = [sa, 0, ca]
+        # Camera y-axis stays as world Y = [0, 1, 0]
+        # Camera x-axis = y cross z = [0,1,0] x [sa,0,ca] = [ca, 0, -sa]
+        R_ObliqueLeft = [[ca,  0, -sa],
+                        [0,   1,  0],
+                        [sa,  0,  ca]]
+        t_ObliqueLeft = [-SDD * sa, 0, -SDD * ca]
+
+        # Oblique Right 45°: mirror of left
+        R_ObliqueRight = [[ca,  0, sa],
+                        [0,   1, 0],
+                        [-sa, 0, ca]]
+        t_ObliqueRight = [SDD * sa, 0, -SDD * ca]
+
+        # Cranial tilt (10°): camera tilted around X axis from AP
+        tilt = np.radians(10)
+        ct, st = np.cos(tilt), np.sin(tilt)
+        R_AP_Cranial = [[1, 0,   0],
+                        [0, ct, -st],
+                        [0, st,  ct]]
+        t_AP_Cranial = [0, -SDD * st, -SDD * ct]
+
+        # Caudal tilt (10°): opposite direction
+        R_AP_Caudal = [[1, 0,    0],
+                    [0, ct,   st],
+                    [0, -st,  ct]]
+        t_AP_Caudal = [0, SDD * st, -SDD * ct]
+
+        # Pedicle Left: ~30° oblique + ~10° cranial tilt
+        oblique_angle = np.radians(30)
+        tilt_angle = np.radians(10)
+
+        co, so = np.cos(oblique_angle), np.sin(oblique_angle)
+        ct, st = np.cos(tilt_angle), np.sin(tilt_angle)
+
+        # Viewing direction: rotate AP direction [0,0,1] by 30° around Y, then 10° around X
+        # After Y rotation: [so, 0, co] = [sin30, 0, cos30]
+        # After X tilt: [so, -co*st, co*ct] = [sin30, -cos30*sin10, cos30*cos10]
+        view_dir = np.array([so, -co * st, co * ct])
+
+        # cam_z = view_dir (optical axis)
+        # cam_y: start with world Y [0,1,0], but need to account for tilt
+        # Safest: build R by composing rotations
+        # R = R_tilt_x @ R_oblique_y
+
+        R_oblique_y = np.array([[co,  0, so],
+                                [0,   1, 0],
+                                [-so, 0, co]])
+
+        R_tilt_x = np.array([[1, 0,   0],
+                            [0, ct,  st],
+                            [0, -st, ct]])
+
+        R_PedicleLeft = R_tilt_x @ R_oblique_y
+        t_PedicleLeft = -SDD * R_PedicleLeft[2, :]  # camera at -SDD * viewing_direction
+
+        # Pedicle Right: mirror oblique angle
+        R_oblique_y_right = np.array([[co,  0, -so],
+                                    [0,   1,  0],
+                                    [so,  0,  co]])
+
+        R_PedicleRight = R_tilt_x @ R_oblique_y_right
+        t_PedicleRight = -SDD * R_PedicleRight[2, :]
+
+        P_Pedicle_Left = make_P(R_PedicleLeft, t_PedicleLeft, K)
+        P_Pedicle_Right = make_P(R_PedicleRight, t_PedicleRight, K)
+
+        # Build all P matrices
+        P_AP = make_P(R_AP, t_AP, K)
+        P_LateralLeft = make_P(R_LateralLeft, t_LateralLeft, K)
+        P_LateralRight = make_P(R_LateralRight, t_LateralRight, K)
+        P_Oblique_Left = make_P(R_ObliqueLeft, t_ObliqueLeft, K)
+        P_Oblique_Right = make_P(R_ObliqueRight, t_ObliqueRight, K)
+        P_AP_Cranial = make_P(R_AP_Cranial, t_AP_Cranial, K)
+        P_AP_Caudal = make_P(R_AP_Caudal, t_AP_Caudal, K)
+
+        projection_stack = np.stack(
+            [
+                P_AP_Caudal,
+                P_AP_Cranial,
+                P_AP,
+                P_LateralLeft,
+                P_LateralRight,
+                P_Oblique_Left,
+                P_Oblique_Right,
+                P_Pedicle_Left,
+                P_Pedicle_Right
+            ],
+            axis=0,
+        )
+        self.projection_matrices = torch.from_numpy(projection_stack).to(dtype=torch.float32)
+
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+    
+    # Load cached voxels
+        cache_path = self.cache_dir / f"{sample['patient']}_{sample['vertebra']}.npy"
+        voxels = np.load(cache_path)
+
+        # Load images
+        drr_images = []
+        for drr_path in sample["drr_files"]:
+            img = np.array(Image.open(drr_path)).astype(np.float32) / 65535.0
+            img = torch.tensor(img).unsqueeze(0).repeat(3, 1, 1)
+            drr_images.append(img)
+
+        vertebra_idx = self.vertebra_to_idx[sample["vertebra"]]
+
+        return torch.stack(drr_images, dim=0), voxels, vertebra_idx
+
+
+class SpineDataloader(DataLoader):
+    def __init__(self, dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False, persistent_workers=False):
+        super().__init__(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
+
+class Down3d(nn.Module):
+    def __init__(self, in_ch, out_ch, stride):
+        super().__init__()
+        self.pool = nn.MaxPool3d(stride)
+        self.block = ResBlock3D(in_ch, out_ch)
+
+    def forward(self, x):
+        return self.block(self.pool(x))
+    
+class Up3d(nn.Module):
+    def __init__(self, in_ch, out_ch, stride):
+        super().__init__()
+        self.up = nn.ConvTranspose3d(in_ch, in_ch//2, kernel_size=2, stride=stride)
+        self.block = ResBlock3D(in_ch, out_ch)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        cat_dim = 1 if x.ndim == 5 else 0
+        x = torch.cat([x, skip], dim=cat_dim)
+        return self.block(x)
+    
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-5):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+
+        intersection = (probs * targets).sum(dim=(1,2,3,4))
+        union = probs.sum(dim=(1,2,3,4)) + targets.sum(dim=(1,2,3,4))
+
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        return 1 - dice.mean()
+    
+
+class ViewAttentionFusion(nn.Module):
+    def __init__(self, channels, num_views):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Conv3d(channels * num_views, channels, 1),
+            nn.ReLU(),
+            nn.Conv3d(channels, num_views, 1)
+        )
+
+    def forward(self, x):
+        # x: (B, V, C, D, H, W)
+        B, V, C, D, H, W = x.shape
+
+        x_flat = x.view(B, V*C, D, H, W)
+        attn = self.attn(x_flat)  # (B, V, D, H, W)
+        attn = torch.softmax(attn, dim=1)
+
+        out = (x * attn.unsqueeze(2)).sum(dim=1)
+        return out
+
+
+class FeatureExtractor(torch.nn.Module):
+    def __init__(self, checkpoint_file: Path, DAX_model_type = "resnet50"):
+        super().__init__()
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.fusion = ViewAttentionFusion(channels=16, num_views=9)
+        self.reducer1 = nn.Conv2d(256,  16, kernel_size=1)
+        self.reducer2 = nn.Conv2d(512,  16, kernel_size=1)
+        self.reducer3 = nn.Conv2d(1024, 16, kernel_size=1)
+        self.reducer4 = nn.Conv2d(2048, 16, kernel_size=1)
+
+        checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+        teacher_checkpoint = checkpoint["teacher"]
+        
+        # Extract backbone weights
+        teacher_dict = {k.replace("module.backbone.", ""): v 
+                    for k, v in teacher_checkpoint.items() 
+                    if k.startswith("module.backbone.")}
+
+        # Create model
+        self.DAX = models.__dict__[DAX_model_type.lower()](weights=None)
+        
+        self.DAX.fc = nn.Identity()
+        # Load weights
+        self.DAX.load_state_dict(teacher_dict, strict=True)
+
+        del self.DAX.avgpool
+        del self.DAX.fc
+
+        def forward_no_flatten(x):
+            x = self.DAX.conv1(x)
+            x = self.DAX.bn1(x)
+            x = self.DAX.relu(x)
+            x = self.DAX.maxpool(x)
+            x1 = self.DAX.layer1(x)
+            x2 = self.DAX.layer2(x1)
+            x3 = self.DAX.layer3(x2)
+            x4 = self.DAX.layer4(x3)
+            #x5 = self.DAX.avgpool(x4)
+            return x1, x2, x3, x4#, x5  
+        
+        # torch.Size([9, 256, 64, 64]) torch.Size([9, 512, 32, 32]) torch.Size([9, 1024, 16, 16]) 
+        # torch.Size([9, 2048, 8, 8]) torch.Size([9, 2048, 1, 1])
+        
+        self.DAX.forward = forward_no_flatten
+
+        self.to(self.device)
+        self.DAX.eval()
+
+        self.sample_grids = {}  # cache per image_size
+        self.backprojector = BackprojectionModule(grid_size=80, world_size=125.0)
+
+    def _get_sample_grids(self, P_matrices, grid_size, image_size):
+        key = (image_size, grid_size)
+        if key not in self.sample_grids:
+            grids = []
+            for i in range(P_matrices.shape[0]):
+                X_proj = P_matrices[i] @ self.backprojector.X_hom
+                depth = X_proj[2].clamp(min=1e-8)
+                p_x = (X_proj[0] / depth / (image_size - 1)) * 2.0 - 1.0
+                p_y = (X_proj[1] / depth / (image_size - 1)) * 2.0 - 1.0
+                grids.append(torch.stack([p_x, p_y], dim=-1).reshape(1, 1, -1, 2))
+            self.sample_grids[key] = grids
+        return self.sample_grids[key]
+
+    def forward(self, x, P_matrices, grid_size=80):
+        x = x.to(self.device)
+        P_matrices = P_matrices.to(self.device)
+
+        # x: (B, V, C, H, W) or (V, C, H, W)
+        if x.ndim == 4:
+            x = x.unsqueeze(0)
+        
+        B, V, C, H, W = x.shape
+        image_size = H
+
+        # P_matrices: (V, 3, 4) → expand to (B, V, 3, 4)
+        if P_matrices.ndim == 3:
+            P_matrices = P_matrices.unsqueeze(0).expand(B, -1, -1, -1)
+
+        # Merge batch and views for ResNet
+        x_flat = x.reshape(B * V, C, H, W)
+
+        with torch.no_grad():
+            x1, x2, x3, x4 = self.DAX(x_flat)
+
+        f1 = self.reducer1(x1)  # (B*V, 8, 64, 64)
+        f2 = self.reducer2(x2)
+        f3 = self.reducer3(x3)
+        f4 = self.reducer4(x4)
+
+        def backproject_batch(features, P_mats):
+            _, C_f, H_f, W_f = features.shape
+            features = features.reshape(B, V, C_f, H_f, W_f)
+            grids = []
+            for b in range(B):
+                vol = self.backprojector(features[b], P_mats[b], image_size)
+                grids.append(vol)  # (V, C, D, D, D)
+            return torch.stack(grids, dim=0)  # (B, V, C, D, D, D)
+
+
+        def fuse(grid):
+            return self.fusion(grid)
+
+        grid1 = backproject_batch(f1, P_matrices)
+        grid2 = backproject_batch(f2, P_matrices)
+        grid3 = backproject_batch(f3, P_matrices)
+        grid4 = backproject_batch(f4, P_matrices)
+
+        grid1 = fuse(grid1)
+        grid2 = fuse(grid2)
+        grid3 = fuse(grid3)
+        grid4 = fuse(grid4)
+
+        return torch.cat([grid1, grid2, grid3, grid4], dim=1)  # (B, 128, D, D, D)
+
+        
+class ResBlock3D(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv1 = nn.Conv3d(in_ch, out_ch, 3, padding=1)
+        self.bn1 = nn.InstanceNorm3d(out_ch)
+        self.conv2 = nn.Conv3d(out_ch, out_ch, 3, padding=1)
+        self.bn2 = nn.InstanceNorm3d(out_ch)
+
+        self.skip = nn.Conv3d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x):
+        identity = self.skip(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.bn2(self.conv2(x))
+        return F.relu(x + identity)
+
+
+class Refiner(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = ResBlock3D(96, 32)
+        self.down1 = Down3d(32, 64, stride=2)
+        self.down2 = Down3d(64, 128, stride=2)
+        self.bottleneck = Down3d(128, 256, stride=2)
+        self.up1 = Up3d(256, 128, stride=2)
+        self.up2 = Up3d(128, 64, stride=2)
+        self.up3 = Up3d(64, 32, stride=2)
+        self.final = nn.Conv3d(32, 1, kernel_size=1)
+
+    def forward(self, feature_grid):
+        x = self.conv1(feature_grid)
+
+        s1 = F.relu(x)       # (B, 32, D, D, D)
+
+        s2 = self.down1(s1)     # (B, 64, D/2)
+        s3 = self.down2(s2)     # (B, 128, D/4)
+
+        b = self.bottleneck(s3) # (B, 256, D/8)
+
+        x = self.up1(b, s3)     # (B, 128, D/4)
+        x = self.up2(x, s2)     # (B, 64, D/2)
+        x = self.up3(x, s1)     # (B, 32, D)
+
+        x = self.final(x)
+
+        return x
+    
+
+class ReconstructionModel(nn.Module):
+    def __init__(self, feature_extractor: FeatureExtractor, refiner: Refiner):
+        super().__init__()
+        self.feature_extractor = feature_extractor
+        self.refiner = refiner
+        self.embedding = nn.Embedding(num_embeddings=50, embedding_dim=32)
+
+    def forward(self, drr_images, projection_matrices, vertebra_idx, grid_size=80):
+        features = self.feature_extractor(drr_images, projection_matrices, grid_size=grid_size)
+        # --- add vertebra embedding ---
+        emb = self.embedding(vertebra_idx)  # (B, 32)
+
+        # expand to 3D
+        emb = emb[:, :, None, None, None]  # (B, 32, 1, 1, 1)
+        emb = emb.expand(-1, -1, features.shape[2], features.shape[3], features.shape[4])
+
+        # concatenate
+        features = torch.cat([features, emb], dim=1)
+        
+        refined_output = self.refiner(features)
+        return refined_output
+    
+
+def evaluate(model, dataloader, criterion, device, projection_matrices):
+    model.eval()
+    total_loss = 0.0
+    count = 0
+    with torch.no_grad():
+        for drr_images, voxels, vertebra_idx in dataloader:
+            drr_images = drr_images.to(device)
+            voxels = voxels.to(device).float()
+            vertebra_idx = vertebra_idx.to(device)
+
+            outputs = model(drr_images, projection_matrices, vertebra_idx, grid_size=80)
+            target = voxels.unsqueeze(1)
+            loss = criterion(outputs, target)
+            
+            total_loss += loss.item()
+            count += 1
+    
+    return total_loss / count
+
+    
+def train(lr, epochs, train_dataloader, val_dataloader, model, save_dir, device, projection_matrices, criterion=nn.BCEWithLogitsLoss()):
+    print("Starting training...")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    trainable_params = (
+    list(model.feature_extractor.reducer1.parameters()) +
+    list(model.feature_extractor.reducer2.parameters()) +
+    list(model.feature_extractor.reducer3.parameters()) +
+    list(model.feature_extractor.reducer4.parameters()) +
+    list(model.refiner.parameters()) +
+    list(model.embedding.parameters())
+)
+
+    optimizer = torch.optim.Adam(trainable_params, lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+
+    best_loss = float('inf')
+    print("Entering training loop...")
+    for epoch in range(epochs):
+        model.train()
+        epoch_loss = 0.0
+        batch_count = 0
+        print("Batch start")
+        dice_scores = []
+        bce_scores = []
+        for batch_idx, (drr_images, voxels, vertebra_idx) in enumerate(train_dataloader):
+            drr_images = drr_images.to(device)
+            voxels = voxels.to(device).float()  # Convert to float for BCELoss
+            vertebra_idx = vertebra_idx.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(drr_images, projection_matrices, vertebra_idx, grid_size=80)
+
+            # Broadcast occupancy target across output channels.
+            target = voxels.unsqueeze(1)
+
+            probs = torch.sigmoid(outputs)
+
+            # --- Dice ---
+            intersection = (probs * target).sum(dim=(1,2,3,4))
+            union = probs.sum(dim=(1,2,3,4)) + target.sum(dim=(1,2,3,4))
+            dice = (2 * intersection + 1e-5) / (union + 1e-5)
+
+            # --- BCE ---
+            bce_log = F.binary_cross_entropy_with_logits(outputs, target, reduction='none')
+            bce_log = bce_log.mean(dim=(1,2,3,4))  # per sample
+
+            loss = criterion(outputs, target)  # sigmoid applied internally
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            dice_scores.extend(dice.detach().cpu().numpy())
+            bce_scores.extend(bce_log.detach().cpu().numpy())
+
+            epoch_loss += loss.item()
+            batch_count += 1
+            if (batch_idx + 1) % 20 == 0:
+                print(f"Processed {batch_idx + 1} images | Loss: {loss.item():.4f}")
+
+        avg_loss = epoch_loss / len(train_dataloader)
+
+        avg_val_loss = evaluate(model, val_dataloader, criterion, device, projection_matrices)
+        scheduler.step(avg_val_loss)
+
+        # Save checkpoint every 10 epochs
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}, Val Loss: {avg_val_loss:.4f}, LR: {current_lr:.6f}")
+
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            torch.save(model.state_dict(), save_dir / "best_model.pth")
+            print(f"New best model saved (loss: {best_loss:.4f})")
+        chunk_size = 100
+
+        dice_avg = [
+            np.mean(dice_scores[i:i+chunk_size])
+            for i in range(0, len(dice_scores), chunk_size)
+        ]
+
+        bce_avg = [
+            np.mean(bce_scores[i:i+chunk_size])
+            for i in range(0, len(bce_scores), chunk_size)
+        ]
+
+
+        save_path = r"C:\Users\karlo\OneDrive\Desktop\DinoVert\score"
+        os.makedirs(save_path, exist_ok=True)
+
+        plt.figure()
+
+        plt.plot(dice_avg, label="Dice")
+        plt.plot(bce_avg, label="BCE")
+
+        plt.xlabel("Chunk (100 vertebrae)")
+        plt.ylabel("Score")
+        plt.title(f"Epoch {epoch+1}")
+
+        plt.legend()
+
+        file_name = os.path.join(save_path, f"scores_epoch_{epoch+1}.png")
+        plt.savefig(file_name)
+        plt.close()
+
+def precompute_voxel_cache(drr_dir, cache_dir, grid_size=80, pitch=0.016):
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(exist_ok=True)
+    
+    samples = []
+    for patient in Path(drr_dir).iterdir():
+        if patient.is_dir():
+            for vertebra in patient.iterdir():
+                if vertebra.is_dir():
+                    mesh_files = list(vertebra.glob("*.npz"))
+                    if mesh_files:
+                        samples.append((patient.name, vertebra.name, mesh_files[0]))
+
+    for i, (patient, vertebra, mesh_file) in enumerate(samples):
+        cache_path = cache_dir / f"{patient}_{vertebra}.npy"
+        if cache_path.exists():
+            continue
+
+        if i % 10 == 0:
+            print(f"Voxelizing [{i}/{len(samples)}]")
+
+        data = np.load(mesh_file)
+        mesh = trimesh.Trimesh(vertices=data['verts'], faces=data['faces'])
+
+        # --- NEW: normalize + margin ---
+        bounds = mesh.bounds
+        center = bounds.mean(axis=0)
+        size = (bounds[1] - bounds[0]).max()
+
+        scale = size * 1.2  # add margin so nothing gets cut
+        mesh.vertices = (mesh.vertices - center) / scale
+
+        # --- voxelize ---
+        pitch = 1.0 / grid_size
+        voxel_grid = mesh.voxelized(pitch=pitch)
+        voxels = voxel_grid.matrix
+
+        
+        voxels = binary_fill_holes(voxels)
+        x, y, z = voxels.shape
+        gs = grid_size
+
+        x, y, z = voxels.shape
+
+        # --- pad only ---
+        pad_x = max(0, gs - x)
+        pad_y = max(0, gs - y)
+        pad_z = max(0, gs - z)
+
+        voxels = np.pad(voxels, (
+            (pad_x // 2, pad_x - pad_x // 2),
+            (pad_y // 2, pad_y - pad_y // 2),
+            (pad_z // 2, pad_z - pad_z // 2)
+        ), mode='constant', constant_values=False)
+
+        # --- safety check ---
+        if voxels.shape != (gs, gs, gs):
+            print("WARNING: unexpected voxel shape:", voxels.shape)
+
+        voxels = voxels.astype(bool)
+        np.save(cache_path, voxels)
+
+class CombinedLoss(nn.Module):
+    def __init__(self, pos_weight, dice_weight=4, gamma=2.0):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.gamma = gamma
+        self.dice = DiceLoss()
+        self.dice_weight = dice_weight
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+
+        # BCE with pos_weight
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=self.pos_weight, reduction='none'
+        )
+
+        # focal scaling
+        p_t = probs * targets + (1 - probs) * (1 - targets)
+        focal = bce * ((1 - p_t) ** self.gamma)
+        focal = focal.mean()
+
+        return focal + self.dice_weight * self.dice(logits, targets)
+def main():
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed = 42
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    
+    ######################################### Hyperparameters and setup #########################################
+    data_dir = Path("C:/Users/karlo/OneDrive/Desktop/1kSpineDataxray2")
+    DAX_checkpoint = Path("C:/Users/karlo/OneDrive/Desktop/DinoVert/dax-checkpoint-resnet50-version-b.pth")
+    cache_dir = Path("C:/Users/karlo/OneDrive/Desktop/Voxels")
+    mode = "train" #"train" or "plot"
+    pretrained_checkpoint = False  # Set to True to load existing checkpoint before training (if available)
+
+    lr = 1e-4
+    imbalance_param = 15.5  # Adjust this based on the ratio of empty to filled voxels in your dataset
+    epochs = 20
+    batch_size = 2
+    num_workers = 2
+    #############################################################################################################
+
+    precompute_voxel_cache(data_dir, cache_dir)
+    dataset = SpineDataset(data_dir, cache_dir)
+    #datasubset = Subset(dataset, list(range(10)))
+
+    train_idx, temp_idx = train_test_split(range(len(dataset)), test_size=0.3, random_state=seed)
+    val_idx, test_idx = train_test_split(temp_idx, test_size=0.333, random_state=seed)  # 0.333 of 0.3 = 0.1
+
+    train_loader = SpineDataloader(Subset(dataset, train_idx), batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, persistent_workers=True)
+    val_loader = SpineDataloader(Subset(dataset, val_idx), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    test_loader = SpineDataloader(Subset(dataset, test_idx), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+
+    dax = FeatureExtractor(DAX_checkpoint).to(device)
+    refiner = Refiner().to(device)
+
+    reconstructor = ReconstructionModel(dax, refiner).to(device)
+    print("Model initialized.")
+
+    ############### load existing checkpoint ########################
+    if pretrained_checkpoint:
+        reconst_checkpoint = Path("C:/Users/karlo/OneDrive/Desktop/DinoVert/models/best_model.pth")
+        state = torch.load(reconst_checkpoint, map_location=device)
+        reconstructor.load_state_dict(state)
+    #################################################################
+    
+    pos_weight = torch.tensor([imbalance_param], device=device)  
+   
+
+    criterion = CombinedLoss(pos_weight)
+
+    if mode == "train":
+        train(lr, epochs, train_loader, val_loader, reconstructor, Path(r"C:\Users\karlo\OneDrive\Desktop\DinoVert\models"), device, dataset.projection_matrices, criterion)
+        model_path = Path(r"C:\Users\karlo\OneDrive\Desktop\DinoVert\models\best_model.pth")
+        reconstructor.load_state_dict(torch.load(model_path, map_location=device))
+        test_loss = evaluate(reconstructor, test_loader, criterion, device, dataset.projection_matrices)
+        print(f"Final test loss: {test_loss:.4f}")
+
+
+    if mode == "plot":
+        with torch.no_grad():
+            example = reconstructor(dataset[0][0].to(device), dataset.projection_matrices.to(device), grid_size=80)
+            probs = torch.sigmoid(example)
+            print(f"Logits  - min: {example.min():.3f}, max: {example.max():.3f}, mean: {example.mean():.3f}")
+            print(f"Probs   - min: {probs.min():.3f}, max: {probs.max():.3f}, mean: {probs.mean():.3f}")
+            print(f"Filled  - {(probs > 0.3).sum().item()} / {probs.numel()} = {(probs > 0.3).float().mean():.4f}")
+    
+        voxels = (probs > 0.3).squeeze(0).cpu().detach().numpy()
+        plot_voxel_comparison_fixed_view_3d(
+            prediction_voxels=voxels,
+            ground_truth_voxels=dataset[0][1],
+            save_path="prediction_vs_ground_truth_fixed_view.png",
+        )
+
+    #test_backprojection_with_image(dataset)
+    #debug_backprojection(dataset)
+    
+    pass
+
+if __name__ == "__main__":
+    main()
