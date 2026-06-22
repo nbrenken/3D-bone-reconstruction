@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from pathlib import Path
 import numpy as np
 import torch
 import nibabel as nib
@@ -19,8 +20,18 @@ from skimage.measure import marching_cubes
 # SETTINGS
 # ============================================================
 
-root = "C:/Users/karlo/OneDrive/Desktop/1kSpineDataxray3"
-base_out_dir = "C:/Users/karlo/OneDrive/Desktop/DinoVert/ShirleySTUFF/output"
+# Set SPINE_CT_ROOT to the root of the 1K Spine CT dataset (must contain data/ and label/).
+_raw_ct_root = os.environ.get("SPINE_CT_ROOT")
+if not _raw_ct_root:
+    raise EnvironmentError(
+        "Set SPINE_CT_ROOT to the root of the 1K Spine CT dataset "
+        "(must contain data/ and label/ subdirectories)."
+    )
+CT_ROOT = _raw_ct_root
+
+# Set SPINE_OUTPUT_DIR to where DRR output should be written (default: <repo_root>/output).
+_DATAGNEN_REPO_ROOT = Path(os.path.abspath(__file__)).parent.parent
+base_out_dir = os.environ.get("SPINE_OUTPUT_DIR", str(_DATAGNEN_REPO_ROOT / "output"))
 
 if torch.backends.mps.is_available():
     device = torch.device("mps")
@@ -30,7 +41,7 @@ else:
     device = torch.device("cpu")
 print("Using device:", device)
 
-data_dir = data_dir = os.path.join(root)  # No 'raw_data', directly use the root folder
+data_dir = CT_ROOT
 
 
 # ============================================================

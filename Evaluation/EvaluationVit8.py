@@ -1,10 +1,14 @@
 import os
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
+import sys
 from pathlib import Path
 import csv
 import numpy as np
 import torch
+
+# Allow importing vision_transformer_dax from AdditionalDAXData/.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "AdditionalDAXData"))
 
 # Import the ViT training classes.
 # This assumes your ViT training file is called:
@@ -279,26 +283,33 @@ def evaluate_test_set(
 
 def main():
     # -------------------------------------------------------------------------
-    # Paths
+    # Paths  (override with env vars or edit directly below)
     # -------------------------------------------------------------------------
-    test_dir = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\test_set"
-    )
+    _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-    cache_dir = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\voxel_cache"
-    )
+    # Set SPINE_TEST_DIR to the folder containing the test split DRR data.
+    _raw_test = os.environ.get("SPINE_TEST_DIR")
+    if not _raw_test:
+        raise EnvironmentError(
+            "Set SPINE_TEST_DIR to the folder containing the test-set DRR data."
+        )
+    test_dir = Path(_raw_test)
 
+    cache_dir = Path(os.environ.get("SPINE_CACHE_DIR") or (_REPO_ROOT / "voxel_cache"))
+
+    # DAX backbone checkpoint — defaults to AdditionalDAXData/ in this repo.
     DAX_checkpoint = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\dax-checkpoint-vit-s-8-version-a.pth"
+        os.environ.get("SPINE_DAX_CKPT") or
+        (_REPO_ROOT / "AdditionalDAXData" / "dax-checkpoint-vit-s-8-version-a.pth")
     )
 
     model_checkpoint = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\models_vit8\best_model.pth"
+        os.environ.get("SPINE_MODEL_CKPT") or (_REPO_ROOT / "Models" / "best_modelViT8.pth")
     )
 
     output_csv = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\EVAL\VIT8\test_segmentation_metrics_results_VIT8.csv"
+        os.environ.get("SPINE_OUTPUT_CSV") or
+        (_REPO_ROOT / "Evaluation" / "results" / "metrics_ViT8.csv")
     )
 
     # Same threshold as in your existing evaluate_dice function.

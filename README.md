@@ -48,11 +48,11 @@ Contains five Python evaluation scripts. Each script evaluates one trained model
 
 | Model | Evaluation script |
 |---|---|
-| DAX18 | DAX18 evaluation script |
-| DAX50 | DAX50 evaluation script |
-| ResNet18 (non-pretrained) | ResNet18 evaluation script |
-| ResNet50 (non-pretrained) | ResNet50 evaluation script |
-| ViT8 | ViT8 evaluation script |
+| DAX18 | `EvaluationDAX18.py` |
+| DAX50 | `EvaluationDAX50.py` |
+| ResNet18 (non-pretrained) | `EvaluationNP18.py` |
+| ResNet50 (non-pretrained) | `EvaluationNP50.py` |
+| ViT8 | `EvaluationVit8.py` |
 
 The scripts load the corresponding checkpoint from `Models/` and compute the evaluation metrics defined in the code.
 
@@ -76,11 +76,11 @@ Contains five Python training scripts, one for each architecture:
 
 | Model | Training script |
 |---|---|
-| DAX18 | DAX18 training script |
-| DAX50 | DAX50 training script |
-| ResNet18 (non-pretrained) | ResNet18 training script |
-| ResNet50 (non-pretrained) | ResNet50 training script |
-| ViT8 | ViT8 training script |
+| DAX18 | `Dax18_Training.py` |
+| DAX50 | `DAX50_Training.py` |
+| ResNet18 (non-pretrained) | `NP18_Training.py` |
+| ResNet50 (non-pretrained) | `NP50_Training.py` |
+| ViT8 | `ViT8_Training.py` |
 
 Each training script is responsible for configuring the data pipeline, initializing the relevant architecture, training the model, and saving the resulting checkpoint.
 
@@ -95,6 +95,38 @@ The repository compares the following models:
 5. **ViT8**
 
 The DAX models use components adapted from the external DAX project, while the ResNet and ViT models serve as comparison baselines.
+
+## Setup
+
+### Environment variables
+
+All scripts use environment variables for paths to external data that cannot ship in the repository. Set them before running any script.
+
+| Variable | Required | Description |
+|---|---|---|
+| `SPINE_CT_ROOT` | Yes (Datageneration) | Root of the 1K Spine CT dataset — must contain `data/` and `label/` subdirectories. |
+| `SPINE_DATA_DIR` | Yes (Training, 3DVisualization) | Path to the DRR output folder produced by `Datageneration/Datageneration.py`. |
+| `SPINE_TEST_DIR` | Yes (Evaluation) | Path to the folder containing the test-split DRR data. |
+| `SPINE_OUTPUT_DIR` | No | Where `Datageneration.py` writes its output. Defaults to `<repo>/output`. |
+| `SPINE_CACHE_DIR` | No | Voxel cache directory used by training and evaluation. Defaults to `<repo>/voxel_cache`. |
+| `SPINE_MODEL_DIR` | No | Directory where training scripts save model checkpoints. Defaults to `<repo>/Models`. |
+| `SPINE_DAX_CKPT` | No | Override path to a DAX backbone checkpoint. Defaults to the matching file in `AdditionalDAXData/`. |
+| `SPINE_MODEL_CKPT` | No | Override path to a trained reconstruction model checkpoint. Defaults to the matching file in `Models/`. |
+| `SPINE_OUTPUT_CSV` | No | Override path for the evaluation results CSV. Defaults to `Evaluation/results/metrics_<model>.csv`. |
+| `SPINE_CT_VOLUMES` | Yes (3DVisualization) | CT volumes directory (e.g. `.../data/colon`). |
+| `SPINE_CT_LABELS` | Yes (3DVisualization) | CT labels directory (e.g. `.../label/colon`). |
+
+### ViT8 note
+
+`ViT8_Training.py` and `EvaluationVit8.py` import `vision_transformer_dax` from `AdditionalDAXData/`. Both files insert that directory onto `sys.path` automatically at import time, so no manual `PYTHONPATH` change is required.
+
+### Dependencies
+
+Install all required packages before running any script. Run:
+
+```bash
+pip install -r requirements.txt
+```
 
 ## Typical Workflow
 
@@ -126,7 +158,7 @@ Install the dependencies required by the individual scripts before training, eva
 
 ## Notes
 
-- Ensure that model paths and dataset paths in the scripts are adjusted to match your local environment.
+- Set the required environment variables (see **Setup** above) before running any script. No hardcoded paths remain in the codebase.
 - Run the data-generation pipeline before training if the required generated dataset is not already available.
 - Use the matching evaluation script and `.pth` checkpoint for each architecture.
 - The DAX-related code in `AdditionalDAXData/` should retain the relevant attribution to the original DAX repository.

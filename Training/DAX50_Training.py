@@ -1096,10 +1096,20 @@ def main():
     np.random.seed(seed)
 
     ######################################### Hyperparameters and setup #########################################
-    data_dir = Path(r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\output")
-    DAX_checkpoint = Path(r"C:\Users\karlo\OneDrive\Desktop\DinoVert\dax-checkpoint-resnet50-version-b.pth")
-    cache_dir = project_root / "voxel_cache"
-    model_dir = project_root / "models"
+    # Set SPINE_DATA_DIR to the DRR output folder from Datageneration/Datageneration.py.
+    _raw_data = os.environ.get("SPINE_DATA_DIR")
+    if not _raw_data:
+        raise EnvironmentError(
+            "Set SPINE_DATA_DIR to the folder produced by Datageneration/Datageneration.py."
+        )
+    data_dir = Path(_raw_data)
+    # DAX backbone checkpoint — defaults to AdditionalDAXData/ in this repo.
+    DAX_checkpoint = Path(
+        os.environ.get("SPINE_DAX_CKPT") or
+        (project_root.parent / "AdditionalDAXData" / "dax-checkpoint-resnet50-version-b.pth")
+    )
+    cache_dir = Path(os.environ.get("SPINE_CACHE_DIR") or (project_root.parent / "voxel_cache"))
+    model_dir = Path(os.environ.get("SPINE_MODEL_DIR") or (project_root.parent / "Models"))
     mode = "train"  # "train", "plot", or "debug"
     pretrained_checkpoint = False
 

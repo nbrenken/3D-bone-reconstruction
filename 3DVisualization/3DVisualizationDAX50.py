@@ -42,28 +42,36 @@ VERT_NAME = "L4"
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-VOLUMES_DIR = Path(
-    r"C:\Users\karlo\OneDrive\Desktop\1kSpineDataxray3\data\colon"
-)
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
-LABELS_DIR = Path(
-    r"C:\Users\karlo\OneDrive\Desktop\1kSpineDataxray3\label\colon"
-)
+# Set SPINE_CT_VOLUMES to the .../data/colon (or relevant) directory of the CT dataset.
+_raw_vol = os.environ.get("SPINE_CT_VOLUMES")
+if not _raw_vol:
+    raise EnvironmentError("Set SPINE_CT_VOLUMES to the CT volumes directory (e.g. .../data/colon).")
+VOLUMES_DIR = Path(_raw_vol)
 
-P_MATRIX_DIR = Path(
-    r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\output"
-)
+# Set SPINE_CT_LABELS to the .../label/colon directory of the CT dataset.
+_raw_lbl = os.environ.get("SPINE_CT_LABELS")
+if not _raw_lbl:
+    raise EnvironmentError("Set SPINE_CT_LABELS to the CT labels directory (e.g. .../label/colon).")
+LABELS_DIR = Path(_raw_lbl)
 
-TRAINING_SCRIPT = Path(
-    r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\ThirdModelTraining.py"
-)
+# Directory containing the *_P.npy projection matrices (output of Datageneration).
+_raw_pmat = os.environ.get("SPINE_DATA_DIR")
+if not _raw_pmat:
+    raise EnvironmentError("Set SPINE_DATA_DIR to the DRR output directory containing *_P.npy files.")
+P_MATRIX_DIR = Path(_raw_pmat)
+
+# Training script is in this repo.
+TRAINING_SCRIPT = _REPO_ROOT / "Training" / "DAX50_Training.py"
 
 MODEL_CKPT = Path(
-    r"C:\Users\karlo\OneDrive\Desktop\DinoVert\SHIRLEYSTUFF\models_dax50\best_model.pth"
+    os.environ.get("SPINE_MODEL_CKPT") or (_REPO_ROOT / "Models" / "best_modelDAX50.pth")
 )
 
 DAX_CKPT = Path(
-    r"C:\Users\karlo\OneDrive\Desktop\DinoVert\dax-checkpoint-resnet50-version-b.pth"
+    os.environ.get("SPINE_DAX_CKPT") or
+    (_REPO_ROOT / "AdditionalDAXData" / "dax-checkpoint-resnet50-version-b.pth")
 )
 
 

@@ -308,22 +308,27 @@ def evaluate_test_set(
 
 def main():
     # -------------------------------------------------------------------------
-    # Paths
+    # Paths  (override with env vars or edit directly below)
     # -------------------------------------------------------------------------
-    test_dir = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\test_set"
-    )
+    _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-    cache_dir = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\voxel_cache"
-    )
+    # Set SPINE_TEST_DIR to the folder containing the test split DRR data.
+    _raw_test = os.environ.get("SPINE_TEST_DIR")
+    if not _raw_test:
+        raise EnvironmentError(
+            "Set SPINE_TEST_DIR to the folder containing the test-set DRR data."
+        )
+    test_dir = Path(_raw_test)
+
+    cache_dir = Path(os.environ.get("SPINE_CACHE_DIR") or (_REPO_ROOT / "voxel_cache"))
 
     model_checkpoint = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\models_ownresnet50\best_model.pth"
+        os.environ.get("SPINE_MODEL_CKPT") or (_REPO_ROOT / "Models" / "best_modelNP50.pth")
     )
 
     output_csv = Path(
-        r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\EVALNP50\test_segmentation_metrics_resultsOWNRES.csv"
+        os.environ.get("SPINE_OUTPUT_CSV") or
+        (_REPO_ROOT / "Evaluation" / "results" / "metrics_NP50.csv")
     )
 
     # Same threshold as in your existing evaluate_dice function.

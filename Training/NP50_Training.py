@@ -1100,9 +1100,15 @@ def main():
     np.random.seed(seed)
 
     ######################################### Hyperparameters and setup #########################################
-    data_dir = Path(r"C:\Users\karlo\OneDrive\Desktop\DinoVert\ShirleySTUFF\output")
-    cache_dir = project_root / "voxel_cache"
-    model_dir = project_root / "models_ownresnet"
+    # Set SPINE_DATA_DIR to the DRR output folder from Datageneration/Datageneration.py.
+    _raw_data = os.environ.get("SPINE_DATA_DIR")
+    if not _raw_data:
+        raise EnvironmentError(
+            "Set SPINE_DATA_DIR to the folder produced by Datageneration/Datageneration.py."
+        )
+    data_dir = Path(_raw_data)
+    cache_dir = Path(os.environ.get("SPINE_CACHE_DIR") or (project_root.parent / "voxel_cache"))
+    model_dir = Path(os.environ.get("SPINE_MODEL_DIR") or (project_root.parent / "Models"))
     mode = "train"  # "train", "plot", or "debug"
     pretrained_checkpoint = False
 
