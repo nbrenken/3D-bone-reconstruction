@@ -3,7 +3,7 @@ imageio==2.36.1
 plotly==5.24.1
 torch==2.5.1+cu121
 torchvision==0.20.1+cu121
-torchio>=0.20.23
+torchio==0.20.23
 Pillow==11.0.0
 matplotlib==3.9.2
 nibabel==5.3.3
@@ -11,6 +11,5 @@ numpy==2.0.2
 scikit-image==0.24.0
 scipy==1.13.1
 scikit-learn==1.5.2
-
 trimesh==4.11.4
 
