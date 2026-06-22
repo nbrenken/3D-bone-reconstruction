@@ -8,6 +8,7 @@ This repository contains the code, pretrained model checkpoints, data-generation
 .
 ├── 3DVisualization/
 ├── AdditionalDAXData/
+├── DataExample/
 ├── Datageneration/
 ├── Evaluation/
 ├── Models/
@@ -21,6 +22,20 @@ This repository contains the code, pretrained model checkpoints, data-generation
 Contains Python code for visualizing model predictions in 3D and comparing them with the corresponding ground-truth pose or geometry.
 
 Use this folder to inspect qualitative model performance, including prediction-to-ground-truth alignment and spatial deviations.
+
+### `DataExample/`
+
+Contains one fully processed example case (`1.3.6.1.4.1.9328.50.4.0001`) that can be used to test the pipeline without running data generation first:
+
+```text
+DataExample/
+├── CT_Scan/               # Raw CT volume and segmentation mask (.nii.gz)
+├── Simulated_x_ray/       # Generated DRRs, vertebra masks, and mesh files (.png, .npz)
+├── VoxelShape/            # Precomputed voxel cache (.npy)
+└── 3D_reconstruction/     # Example 3D reconstruction overlay (.png)
+```
+
+To use it, point `SPINE_DATA_DIR` and `SPINE_TEST_DIR` to `DataExample/Simulated_x_ray/` and `SPINE_CACHE_DIR` to `DataExample/VoxelShape/`.
 
 ### `AdditionalDAXData/`
 
@@ -130,21 +145,34 @@ pip install -r requirements.txt
 
 ## Typical Workflow
 
+**Quick start (using the included example data):**
+
+```text
+1. Point env vars at DataExample/
+   SPINE_DATA_DIR  → DataExample/Simulated_x_ray/
+   SPINE_TEST_DIR  → DataExample/Simulated_x_ray/
+   SPINE_CACHE_DIR → DataExample/VoxelShape/
+
+2. Train or evaluate directly — skip data generation
+```
+
+**Full workflow (your own dataset):**
+
 ```text
 1. Generate data
-   Datageneration/
+   Datageneration/  (requires SPINE_CT_ROOT)
 
 2. Train one of the five models
-   Training/
+   Training/        (requires SPINE_DATA_DIR)
 
 3. Save or load checkpoints
    Models/
 
 4. Evaluate the trained model
-   Evaluation/
+   Evaluation/      (requires SPINE_TEST_DIR)
 
 5. Inspect predictions visually against ground truth
-   3DVisualization/
+   3DVisualization/ (requires SPINE_CT_VOLUMES, SPINE_CT_LABELS, SPINE_DATA_DIR)
 ```
 
 ## External Dependencies
@@ -153,8 +181,6 @@ This project depends on external code and frameworks, including:
 
 - DAX: https://github.com/JoshuaScheuplein/DAX
 - DiffDRR: https://github.com/eigenvivek/DiffDRR
-
-Install the dependencies required by the individual scripts before training, evaluating, or generating data. The exact package versions should be documented in a `requirements.txt` or environment file if reproducibility is required.
 
 ## Notes
 
