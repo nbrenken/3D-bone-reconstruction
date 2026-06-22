@@ -17,7 +17,7 @@ from skimage.measure import marching_cubes
 # ============================================================
 
 root = r"C:\Users\karlo\OneDrive\Desktop\1kSpineData"
-base_out_dir = r"C:/Users/karlo/OneDrive/Desktop/1kSpineDataxrayspls"
+base_out_dir = r"C:/Users/karlo/OneDrive/Desktop/1kSpineDataxray2"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -39,7 +39,7 @@ for folder in target_folders:
                 cases.append(os.path.join(root_dir, f))
 
 cases = sorted(cases)
-cases = cases[331:] #due to crash once 
+#cases = cases[331:] #in case of crash 
 print("Total CT files:", len(cases))
 
 
@@ -89,8 +89,6 @@ dely = 0.5
 parameterization = "euler_angles"
 convention = "ZYX"
 
-translation = torch.tensor([[0.0, 1200, 0]], dtype=torch.float32, device=device)
-
 
 # ============================================================
 # VIEWS
@@ -117,11 +115,12 @@ views_deg = {
 
 view_names = list(views_deg.keys())
 
+translation = torch.tensor([[0.0, 1200, 0]], dtype=torch.float32, device=device)
+translations = translation.repeat(len(view_names), 1)
+
 rotations = torch.from_numpy(
     np.array([np.deg2rad(v) for v in views_deg.values()], dtype=np.float32)
 ).to(device)
-
-translations = translation.repeat(len(view_names), 1)
 
 
 # ============================================================
@@ -203,9 +202,64 @@ for ct_path in cases:
 
         min_x, max_x, min_y, max_y, min_z, max_z = compute_bbox(vert_mask)
 
+        # FIRST crop
         submask = vert_mask[min_x:max_x, min_y:max_y, min_z:max_z]
         ct_crop = ct_np[min_x:max_x, min_y:max_y, min_z:max_z]
-        vert_crop = ct_crop * submask
+
+        # ====================================================
+        # HARD CENTERING IN VOXEL SPACE
+        # ====================================================
+
+        coords = np.argwhere(submask > 0)
+        center_voxel = coords.mean(axis=0)
+
+        vol_center = np.array(submask.shape) / 2.0
+        shift = (vol_center - center_voxel).astype(int)
+
+        # create empty arrays
+        ct_centered = np.zeros_like(ct_crop)
+        mask_centered = np.zeros_like(submask)
+
+        # compute valid slicing ranges
+        src_x0 = max(0, -shift[0])
+        src_x1 = min(submask.shape[0], submask.shape[0] - shift[0])
+
+        src_y0 = max(0, -shift[1])
+        src_y1 = min(submask.shape[1], submask.shape[1] - shift[1])
+
+        src_z0 = max(0, -shift[2])
+        src_z1 = min(submask.shape[2], submask.shape[2] - shift[2])
+
+        dst_x0 = max(0, shift[0])
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+
+        dst_y0 = max(0, shift[1])
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+
+        dst_z0 = max(0, shift[2])
+        dst_z1 = dst_z0 + (src_z1 - src_z0)
+
+        # apply shift
+        ct_centered[dst_x0:dst_x1, dst_y0:dst_y1, dst_z0:dst_z1] = \
+            ct_crop[src_x0:src_x1, src_y0:src_y1, src_z0:src_z1]
+
+        mask_centered[dst_x0:dst_x1, dst_y0:dst_y1, dst_z0:dst_z1] = \
+            submask[src_x0:src_x1, src_y0:src_y1, src_z0:src_z1]
+
+        # overwrite with centered data
+        ct_crop = ct_centered
+        submask = mask_centered
+        bone_threshold = 15  # try 150–300
+
+        ct_bone = ct_crop.copy()
+        ct_bone[ct_bone < bone_threshold] = 0
+
+        vert_crop = ct_bone * submask
+        ct_crop = ct_bone
+
+        
+
+
 
         # ====================================================
         # MESH + PCA ALIGNMENT
